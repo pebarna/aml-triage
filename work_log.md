@@ -1,6 +1,6 @@
 # Work log — aml-triage
 
-Maintained by hand as the tutorial progresses. Last updated 2026-08-24.
+Maintained by hand as the tutorial progresses. Last updated 2026-08-25.
 
 ## High-level summary
 
@@ -12,13 +12,13 @@ with a cited rationale. Phase 3 is the eval harness that measures the triage lay
 
 Current state: Phase 1 is complete. `src/aml_triage/scripts/train_baseline.py` runs the full
 pipeline end to end and wrote the Phase 1 deliverable to `reports/phase1_report.json`
-(precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is in progress: retrieval
-(`retrieval.py`) and the structured decision contract (`triage_schema.py`) exist, but the agent that
-wires them to a live model does not yet.
+(precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is complete: retrieval
+(`retrieval.py`), the structured decision contract (`triage_schema.py`), and the end-to-end agent
+(`triage.py`) all exist. Phase 3, the eval harness, is next.
 
 Tech stack as it actually stands in `pyproject.toml`: Python >= 3.13, `uv` with the `uv_build`
 backend, `pandas`, `scikit-learn`, `xgboost`, `sentence-transformers`, and `pytest` in the dev
-dependency group. `anthropic` is not yet installed.
+dependency group. `anthropic` is now a runtime dependency too, pinned as `anthropic>=1.0.0`.
 
 | Lesson | Produced | Status |
 | --- | --- | --- |
@@ -32,9 +32,9 @@ dependency group. `anthropic` is not yet installed.
 | 008 | `retrieval.py` — `top_k_typologies(...)` plus private helpers | Complete |
 | 009 | `retrieval.py` — `top_k_typologies_hybrid(...)`, `_embedding_scores(...)` | Complete |
 | 010 | `triage_schema.py` — `TRIAGE_TOOL_SCHEMA`, `build_prompt`, `parse_triage_decision` | Complete |
-| 011 | `src/aml_triage/triage.py` — `triage(...)` | In progress |
+| 011 | `src/aml_triage/triage.py` — `triage(...)` | Complete |
 
-Next action for 011: run `uv add anthropic`, then write `src/aml_triage/triage.py`.
+Next action: lesson 012 — build the hand-labeled triage eval set.
 
 ## Per-lesson log
 
@@ -362,24 +362,23 @@ No LLM is called in this lesson.
 
 ### What I built
 
-Not yet built. What remains:
-
-1. `uv add anthropic` (needs a shell; `anthropic` is not yet in `pyproject.toml`).
-2. Create `src/aml_triage/triage.py` with
-   `triage(transaction, classifier_score, *, client=None, k=3, corpus_path=None, alpha=0.5) -> dict`,
-   wiring retrieval → prompt → forced tool call → parsing:
-   - construct a real `anthropic.Anthropic()` only when `client is None`;
-   - call `top_k_typologies_hybrid(...)` with the query
-     `f"{transaction['type']} transaction of amount {transaction['amount']}"`, passing `k`,
-     `corpus_path`, and `alpha` straight through;
-   - call `build_prompt(...)`;
-   - call `client.messages.create(...)` with `model` read from the `TRIAGE_MODEL` env var (default
-     `"claude-haiku-4-5-20251001"`), `max_tokens=1024`, `tools=[TRIAGE_TOOL_SCHEMA]`,
-     `tool_choice={"type": "tool", "name": TRIAGE_TOOL_SCHEMA["name"]}`, and a single user message;
-   - extract the tool-use block, pass its `input` and the set of retrieved IDs to
-     `parse_triage_decision(...)`;
-   - copy the result with `result = dict(parse_triage_decision(...))` and add a `"retrieved"` key
-     before returning, rather than mutating the parsed dict in place.
+`anthropic>=1.0.0` added to `pyproject.toml` as a runtime dependency, plus
+`src/aml_triage/triage.py` with
+`triage(transaction, classifier_score, *, client=None, k=3, corpus_path=None, alpha=0.5) -> dict`,
+wiring retrieval → prompt → forced tool call → parsing. When `client is None` it imports `anthropic`
+and constructs `anthropic.Anthropic()`; that `import anthropic` sits inside the `if client is None:`
+branch, so it never executes when a client is injected. It then builds the query
+`f"{transaction['type']} transaction of amount {transaction['amount']}"`, passes it to
+`top_k_typologies_hybrid(query, k=k, corpus_path=corpus_path, alpha=alpha)` as `retrieved`, renders
+`build_prompt(transaction, classifier_score, retrieved)`, and calls `client.messages.create(...)`
+with `model=os.environ.get("TRIAGE_MODEL", "claude-haiku-4-5-20251001")`, `max_tokens=1024`,
+`tools=[TRIAGE_TOOL_SCHEMA]`, `tool_choice={"type": "tool", "name": TRIAGE_TOOL_SCHEMA["name"]}`,
+and a single user message carrying the prompt. It selects the tool-use block with
+`next(block for block in response.content if block.type == "tool_use")`, builds
+`known_ids = {item["id"] for item in retrieved}`, and returns
+`dict(parse_triage_decision(tool_use.input, known_ids))` with a `"retrieved"` key added — a copy of
+`parse_triage_decision`'s output rather than a mutation of it, so the returned dict carries
+`decision`, `rationale`, `cited_typology_ids`, and `retrieved`.
 
 ### Knowledge nuggets
 
@@ -399,15 +398,22 @@ Not yet built. What remains:
   loop, never an auto-executed decision.
 - A passing unit test with a fake client proves the wiring and the citation guard, not that real
   Claude output is sensible. That only comes from a live run.
+- Because the `import anthropic` statement lives inside the `if client is None:` branch, it does not
+  run during the tests at all — the module stays importable and usable by any caller that always
+  injects a client, whether or not the SDK is even reachable.
+- `known_ids` is built from `retrieved`, not from the full corpus, so a citation to a real typology
+  that was simply never shown on this call is rejected exactly like a fabricated ID. A
+  plausible-looking rationale resting on a document the model never read is the failure being
+  guarded against.
 
 ### Checks
 
-`uv run pytest ../aml-tutor/tests/011_test_triage_agent.py -v` — Not yet run.
+`uv run pytest ../aml-tutor/tests/011_test_triage_agent.py -v` — Passed, both
+`test_triage_forces_the_structured_tool_and_returns_the_parsed_decision` and
+`test_triage_raises_when_the_model_cites_something_it_was_not_shown`.
 
 ## Open threads
 
-- Finish lesson 011: run `uv add anthropic`, write `src/aml_triage/triage.py`, then run
-  `uv run pytest ../aml-tutor/tests/011_test_triage_agent.py -v`.
 - Optional and non-graded: the manual pressure test from spec 011 — export `ANTHROPIC_API_KEY`, pick
   a transaction the Phase 1 classifier actually flagged, call `triage(...)` without `client=` against
   the live API, and read the decision, rationale, and citations to calibrate whether the model is
