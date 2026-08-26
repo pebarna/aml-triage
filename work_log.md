@@ -14,8 +14,9 @@ Current state: Phase 1 is complete. `src/aml_triage/scripts/train_baseline.py` r
 pipeline end to end and wrote the Phase 1 deliverable to `reports/phase1_report.json`
 (precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is complete: retrieval
 (`retrieval.py`), the structured decision contract (`triage_schema.py`), and the end-to-end agent
-(`triage.py`) all exist. Phase 3 has started: `eval.py` and the hand-labeled golden set
-(`data/triage_eval_set.jsonl`, 16 cases) exist; lessons 013–015 are next.
+(`triage.py`) all exist. Phase 3 is underway: `eval.py` now holds `load_eval_set` and
+`deterministic_score`, and the hand-labeled golden set (`data/triage_eval_set.jsonl`, 16 cases)
+exists; lessons 014–015 are next.
 
 Tech stack as it actually stands in `pyproject.toml`: Python >= 3.13, `uv` with the `uv_build`
 backend, `pandas`, `scikit-learn`, `xgboost`, `sentence-transformers`, and `pytest` in the dev
@@ -35,8 +36,9 @@ dependency group. `anthropic` is now a runtime dependency too, pinned as `anthro
 | 010 | `triage_schema.py` — `TRIAGE_TOOL_SCHEMA`, `build_prompt`, `parse_triage_decision` | Complete |
 | 011 | `src/aml_triage/triage.py` — `triage(...)` | Complete |
 | 012 | `eval.py` — `load_eval_set(path)`; `data/triage_eval_set.jsonl` (16 hand-labeled cases) | Complete |
+| 013 | `eval.py` — `deterministic_score(case, result)` | Complete |
 
-Next action: lesson 013 — deterministic triage checks.
+Next action: lesson 014 — LLM-as-judge scoring.
 
 ## Per-lesson log
 
@@ -481,6 +483,56 @@ more synthetic data.
 set, allowed decision values, more than one decision type used, and non-blank notes. The tests check
 structure only; whether the judgments are good was checked in conversation against the transaction
 fields.
+
+## 013 — Deterministic triage checks
+
+### What I built
+
+`deterministic_score(case, result)` added to `src/aml_triage/eval.py`, below `load_eval_set`. It
+takes one row of my hand-labeled eval set as `case` and one return value of `triage(...)` as
+`result`, and returns two booleans:
+`{"decision_match": result["decision"] == case["label_decision"], "citation_present": len(result["cited_typology_ids"]) > 0}`.
+No I/O, no model call, nothing to configure. Nothing calls it yet — the loop over the eval set is
+lesson 015's job; for now the only caller is the baked-in test.
+
+### Knowledge nuggets
+
+- The two argument shapes are deliberately asymmetric: `case` carries `label_decision` (my call, from
+  `data/triage_eval_set.jsonl`) and `result` carries `decision` (the agent's call, from `triage`).
+  Confusing the two would produce a function that always reports agreement.
+- The three citation checks live in three different places and fail three different ways. Does the id
+  exist and was it shown? — `parse_triage_decision`, at generation time, raises `ValueError`. Was
+  anything cited at all? — `deterministic_score`, recorded as `False`. Was the citation actually
+  relevant? — the LLM judge in 014, scored by a model.
+- Because the validity guard raises inside `triage(...)`, a result with a fabricated or unshown
+  citation never becomes a return value. By the time anything reaches `deterministic_score`, an
+  invalid citation is structurally impossible, not merely unlikely — there is nothing left to check.
+  Checking validity here instead would mean accumulating a corpus of results containing fabricated
+  citations plus a number saying how often that happened.
+- `citation_present == False` is the one failure a relevance judge structurally cannot express: with
+  an empty citation list, "is this citation relevant?" has no subject, and a judge shown only a
+  rationale may well score fluent prose well. It is worth short-circuiting on — there is nothing to
+  judge.
+- `decision_match == False` is the opposite: it is the case most worth reading, not least. The same
+  `False` is produced by the agent missing something I saw, by me missing something the agent saw,
+  and by my own label being inconsistent — and I already found three inconsistencies in my own file
+  in 012. Skipping the judge on mismatches would discard every informative case.
+- `deterministic_score` does not validate my labels. It takes `label_decision` as given and reports
+  whether the agent's decision equals it, which is exactly why the consistency work in 012 mattered.
+- It scores one case, not the set. Two booleans about a single row; turning sixteen of those into an
+  agreement rate is aggregation, and that is lesson 015.
+- The split exists for cost. Running the eval means one live `triage` call per case; the deterministic
+  checks add nothing on top of what that call already returned, while the 014 judge adds a second
+  model call per case. Cheap checks first.
+- The pressure test this cannot catch: an agent that always returns `{"decision": "monitor",
+  "cited_typology_ids": ["TY-001"]}` without reading the transaction passes `citation_present` every
+  time. That is precisely what 014 is for.
+
+### Checks
+
+`uv run pytest ../aml-tutor/tests/013_test_deterministic_checks.py -v` — Passed, all three:
+`decision_match` true when decisions agree, false when they disagree, and `citation_present` false
+when `cited_typology_ids` is empty.
 
 ## Open threads
 
