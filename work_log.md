@@ -14,9 +14,10 @@ Current state: Phase 1 is complete. `src/aml_triage/scripts/train_baseline.py` r
 pipeline end to end and wrote the Phase 1 deliverable to `reports/phase1_report.json`
 (precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is complete: retrieval
 (`retrieval.py`), the structured decision contract (`triage_schema.py`), and the end-to-end agent
-(`triage.py`) all exist. Phase 3 is underway: `eval.py` now holds `load_eval_set` and
-`deterministic_score`, and the hand-labeled golden set (`data/triage_eval_set.jsonl`, 16 cases)
-exists; lessons 014–015 are next.
+(`triage.py`) all exist. Phase 3 is underway: `eval.py` now holds `load_eval_set`,
+`deterministic_score`, and the LLM judge (`JUDGE_TOOL_SCHEMA`, `_judge_prompt`, `llm_judge_score`),
+and the hand-labeled golden set (`data/triage_eval_set.jsonl`, 16 cases) exists; lesson 015, the
+agreement-rate report, is the last one left.
 
 Tech stack as it actually stands in `pyproject.toml`: Python >= 3.13, `uv` with the `uv_build`
 backend, `pandas`, `scikit-learn`, `xgboost`, `sentence-transformers`, and `pytest` in the dev
@@ -37,8 +38,9 @@ dependency group. `anthropic` is now a runtime dependency too, pinned as `anthro
 | 011 | `src/aml_triage/triage.py` — `triage(...)` | Complete |
 | 012 | `eval.py` — `load_eval_set(path)`; `data/triage_eval_set.jsonl` (16 hand-labeled cases) | Complete |
 | 013 | `eval.py` — `deterministic_score(case, result)` | Complete |
+| 014 | `eval.py` — `JUDGE_TOOL_SCHEMA`, `_judge_prompt(result)`, `llm_judge_score(result, *, client=None)` | Complete |
 
-Next action: lesson 014 — LLM-as-judge scoring.
+Next action: lesson 015 — the agreement-rate report.
 
 ## Per-lesson log
 
@@ -533,6 +535,69 @@ lesson 015's job; for now the only caller is the baked-in test.
 `uv run pytest ../aml-tutor/tests/013_test_deterministic_checks.py -v` — Passed, all three:
 `decision_match` true when decisions agree, false when they disagree, and `citation_present` false
 when `cited_typology_ids` is empty.
+
+## 014 — LLM-as-judge scoring
+
+### What I built
+
+Three additions to `src/aml_triage/eval.py`, plus `import os` at the top:
+
+- `JUDGE_TOOL_SCHEMA`, an Anthropic-shaped tool named `submit_judge_verdict` requiring exactly two
+  fields, `agrees` (boolean) and `comment` (string).
+- `_judge_prompt(result)`, a pure function rendering the agent's decision, its rationale, the ids it
+  cited, and the id/title/text of every retrieved typology, ending with "Does the rationale plausibly
+  follow from the cited typology text?".
+- `llm_judge_score(result, *, client=None)`, which constructs `anthropic.Anthropic()` only when no
+  client is injected, calls `client.messages.create(...)` with `max_tokens=512`,
+  `tools=[JUDGE_TOOL_SCHEMA]` and `tool_choice` naming that tool, pulls the `tool_use` block out of
+  `response.content`, and returns `{"agrees": ..., "comment": ...}`.
+
+### Knowledge nuggets
+
+- The judge answers a narrow question: does this rationale follow from the text of the typology it
+  cites? It is a consistency check between a claim and its evidence, not a check on whether the
+  agent picked the right typology and not a check on whether the decision was correct.
+- `_judge_prompt` does not include the transaction. No `amount`, no `type`, no balances — so the
+  judge structurally cannot tell whether a typology applies to the row being triaged. It can only
+  catch a contradiction visible from the rationale and the typology text alone, such as citing
+  Structuring (many small transactions under a threshold) while writing "a single large withdrawal".
+- Therefore `agrees: True` does not mean the decision was right. An agent that misreads a typology
+  the same way on every case scores `agrees: True` every time, and only the hand-labeled decisions
+  from 012 expose it. Supplementary signal, not foundational — the SR 11-7 artifact is the SME-labeled
+  golden set.
+- The prompt renders *every* retrieved typology, not only the cited ones, so the judge can see that a
+  better-fitting document was sitting there unused. Feeding it only the cited text would hide exactly
+  that failure.
+- The two scorers differ in reach, not just in signature. `deterministic_score(case, result)` needs a
+  human label, so it can only ever run on the 16-row eval set. `llm_judge_score(result)` needs only a
+  triage result, so it could score live production traffic where nothing is labeled — a weaker signal
+  per case that never runs out. That is what "ongoing monitoring" means here.
+- No separate `retrieved=` parameter, deliberately. `retrieved` is the exact document set the agent
+  saw on that call; reproducing it later would mean re-running hybrid retrieval with the same query,
+  `k`, `corpus_path` and `alpha`, and the embedding half shifts across model versions anyway. A
+  separate parameter would create a path where the judge scores a rationale against documents the
+  agent never saw and returns a confident verdict on a comparison that never happened — worse than no
+  signal, because it looks like a real one. Reading `result["retrieved"]` makes the result
+  self-contained: it can be written to disk, moved, and judged later with no substitution possible.
+- No validation step, unlike `triage`. `parse_triage_decision` exists because a fabricated citation is
+  checkable against a known set; a boolean and a free-text comment are not checkable against anything,
+  so there is nothing to guard.
+- Python notes picked up here: a bare `*` in a signature makes everything after it keyword-only, which
+  is why `llm_judge_score(result, fake)` is a `TypeError` — positional for what the function is about,
+  keyword-only for how it runs. A leading underscore marks a name as internal (only `import *`
+  enforces it); `_judge_prompt` is underscored because nothing outside the module should depend on it,
+  while the baked-in test calling it directly is normal — tests reach into internals by design.
+- `response.content` is a list of blocks, because a reply can contain narration text and a tool call.
+  `next(block for block in response.content if block.type == "tool_use")` takes the first tool block
+  and raises `StopIteration` if there is none — which `tool_choice` forcing the tool makes
+  effectively impossible.
+
+### Checks
+
+`uv run pytest ../aml-tutor/tests/014_test_llm_judge.py -v` — Passed, both
+`test_judge_forces_a_structured_tool_and_returns_its_verdict` and
+`test_judge_prompt_includes_the_rationale_and_cited_typology_text`. The tests prove wiring and
+parsing, not judge accuracy.
 
 ## Open threads
 
