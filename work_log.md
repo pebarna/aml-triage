@@ -1,6 +1,6 @@
 # Work log — aml-triage
 
-Maintained by hand as the tutorial progresses. Last updated 2026-08-25.
+Maintained by hand as the tutorial progresses. Last updated 2026-08-26.
 
 ## High-level summary
 
@@ -14,7 +14,8 @@ Current state: Phase 1 is complete. `src/aml_triage/scripts/train_baseline.py` r
 pipeline end to end and wrote the Phase 1 deliverable to `reports/phase1_report.json`
 (precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is complete: retrieval
 (`retrieval.py`), the structured decision contract (`triage_schema.py`), and the end-to-end agent
-(`triage.py`) all exist. Phase 3, the eval harness, is next.
+(`triage.py`) all exist. Phase 3 has started: `eval.py` and the hand-labeled golden set
+(`data/triage_eval_set.jsonl`, 16 cases) exist; lessons 013–015 are next.
 
 Tech stack as it actually stands in `pyproject.toml`: Python >= 3.13, `uv` with the `uv_build`
 backend, `pandas`, `scikit-learn`, `xgboost`, `sentence-transformers`, and `pytest` in the dev
@@ -33,8 +34,9 @@ dependency group. `anthropic` is now a runtime dependency too, pinned as `anthro
 | 009 | `retrieval.py` — `top_k_typologies_hybrid(...)`, `_embedding_scores(...)` | Complete |
 | 010 | `triage_schema.py` — `TRIAGE_TOOL_SCHEMA`, `build_prompt`, `parse_triage_decision` | Complete |
 | 011 | `src/aml_triage/triage.py` — `triage(...)` | Complete |
+| 012 | `eval.py` — `load_eval_set(path)`; `data/triage_eval_set.jsonl` (16 hand-labeled cases) | Complete |
 
-Next action: lesson 012 — build the hand-labeled triage eval set.
+Next action: lesson 013 — deterministic triage checks.
 
 ## Per-lesson log
 
@@ -412,10 +414,81 @@ and a single user message carrying the prompt. It selects the tool-use block wit
 `test_triage_forces_the_structured_tool_and_returns_the_parsed_decision` and
 `test_triage_raises_when_the_model_cites_something_it_was_not_shown`.
 
+## 012 — The hand-labeled triage eval set
+
+### What I built
+
+`src/aml_triage/eval.py` with `load_eval_set(path)`, which opens a JSON-Lines file and returns
+`[json.loads(line) for line in f if line.strip()]` — one dict per non-blank line. Plus
+`data/triage_eval_set.jsonl`, my own golden set: the 16 candidates from
+`../aml-tutor/tests/fixtures/triage_eval_candidates.jsonl`, each carrying its original `transaction`
+and `classifier_score` plus two fields I wrote myself, `label_decision` (escalate / monitor / close)
+and `label_note` (one sentence naming the fields that drove the call). Final distribution: 8
+escalate, 4 monitor, 4 close. Unlike every other lesson, the deliverable here is the judgment, not
+the code — the tutorial has no doer fallback for the labels, because invented labels would just be
+more synthetic data.
+
+### Knowledge nuggets
+
+- The `classifier_score` in the candidate pool is not model output. It is hardcoded
+  `0.95 if is_fraud else 0.05` by the fixture-building script, so it is PaySim's own `isFraud` flag
+  rewritten as a number. It has exactly two distinct values across the file, carries no information
+  about severity, and deferring to it would mean copying the answer key rather than reading the
+  transaction.
+- A destination balance that fails to move is a generation artifact, not a laundering signal. Real
+  laundering typologies are behavioural (structuring, layering, pass-through); a ledger that does not
+  reconcile is a data-integrity ticket. In PaySim it is worse than merely unrelated — it correlates
+  with `isFraud`, which is part of why models on this dataset score well and do not transfer.
+- The arithmetic proves it runs backwards: candidate row 7 (flagged, 0.95) reconciles to the cent
+  (2,122,336.55 + 202,978.65 = 2,325,315.20 vs 2,325,315.19), while rows 9 and 11 (unflagged, 0.05)
+  are off by 4,222 and 34,472 respectively.
+- `oldbalanceOrg: 0.0` generally means *not recorded*, not *actually zero*. Rows 9 and 11 share that
+  pattern and are unflagged, so the zero itself carries no fraud signal.
+- `PAYMENT` rows go to `M...` merchant accounts, whose balances PaySim never tracks at all — which is
+  why every payment in the pool shows destination `0.0 → 0.0`. `CASH_OUT` goes to a `C...` customer
+  account: in mobile money, cashing out means handing credit to an agent who is themselves an account
+  holder, so that destination has a real tracked balance.
+- The raw data shows PaySim's fraud script directly: a `TRANSFER` and a `CASH_OUT` of the identical
+  amount at the same `step`, both flagged — move funds to a controlled account, then cash the same
+  sum out. That is genuine layering, but seeing it needs `nameOrig`/`nameDest` to link the two rows,
+  and `add_features` drops both. So neither the model nor these labels can see it.
+- The labeling rule I settled on: when the origin balance cannot account for the amount, discard that
+  column as unreliable and judge on what remains. Two corroborating signals is `escalate` (row 1:
+  amount equals `oldbalanceOrg` to the cent leaving zero, AND a previously empty destination receives
+  exactly that sum). One surviving signal plus a data-quality problem is `monitor` (row 15: 40,182
+  cannot fund a 1.34M transfer).
+- `monitor` means the deciding evidence is not in this row. A single large cash-out emptying an
+  account is unremarkable if the customer was closing it and a structuring pattern if it repeats four
+  times next week; one transaction cannot distinguish those. That is exactly the call a script cannot
+  make, which is why the labels have to be hand-written.
+- Writing the notes down surfaced three inconsistencies invisible until they sat side by side: rows 9
+  and 11 carrying opposite decisions on identical field patterns; row 13 marked `monitor` for
+  "draining" an account it took 0.7% of; and row 15's decision reading `escalate` while its own note
+  said the case was not actionable.
+- That last one is the dangerous shape. Lesson 013 compares `label_decision` only — nothing reads the
+  note at comparison time — so a note that argues for `monitor` beside a decision of `escalate`
+  silently counts as a disagreement with an agent that reasoned exactly as I did. Inconsistent labels
+  surface downstream looking like an agent bug.
+- Intra-rater consistency is the whole game here. A real model-risk review has multiple SMEs label
+  overlapping subsets and checks their agreement before trusting the set at all; I am both the SME
+  and the reviewer, so the discipline has to be self-imposed.
+- 16 cases is a floor, not SEED.md's 30–50 target. At this size the agreement rate in lesson 015
+  moves 6 percentage points every time a single case flips.
+
+### Checks
+
+`uv run pytest ../aml-tutor/tests/012_test_eval_set.py -v` — Passed, all five: row count, exact key
+set, allowed decision values, more than one decision type used, and non-blank notes. The tests check
+structure only; whether the judgments are good was checked in conversation against the transaction
+fields.
+
 ## Open threads
 
 - Optional and non-graded: the manual pressure test from spec 011 — export `ANTHROPIC_API_KEY`, pick
   a transaction the Phase 1 classifier actually flagged, call `triage(...)` without `client=` against
   the live API, and read the decision, rationale, and citations to calibrate whether the model is
   being useful or hallucinating.
-- Phase 3, the eval harness (lessons 012–015), is still ahead.
+- Keep labeling beyond the 16-case floor toward SEED.md's 30–50 target, applying the same
+  origin-balance rule to each new case; the agreement rate in lesson 015 only means something at
+  larger n.
+- Cosmetic: candidate row 16's `label_note` has a typo, "ammount".
