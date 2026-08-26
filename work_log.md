@@ -14,10 +14,10 @@ Current state: Phase 1 is complete. `src/aml_triage/scripts/train_baseline.py` r
 pipeline end to end and wrote the Phase 1 deliverable to `reports/phase1_report.json`
 (precision 0.906, recall 0.756, PR-AUC 0.884, threshold 0.571). Phase 2 is complete: retrieval
 (`retrieval.py`), the structured decision contract (`triage_schema.py`), and the end-to-end agent
-(`triage.py`) all exist. Phase 3 is underway: `eval.py` now holds `load_eval_set`,
-`deterministic_score`, and the LLM judge (`JUDGE_TOOL_SCHEMA`, `_judge_prompt`, `llm_judge_score`),
-and the hand-labeled golden set (`data/triage_eval_set.jsonl`, 16 cases) exists; lesson 015, the
-agreement-rate report, is the last one left.
+(`triage.py`) all exist. Phase 3 is complete: `eval.py` holds `load_eval_set`,
+`deterministic_score`, the LLM judge (`JUDGE_TOOL_SCHEMA`, `_judge_prompt`, `llm_judge_score`), and
+now `report`; the hand-labeled golden set (`data/triage_eval_set.jsonl`, 16 cases) exists; all
+fifteen lessons are done.
 
 Tech stack as it actually stands in `pyproject.toml`: Python >= 3.13, `uv` with the `uv_build`
 backend, `pandas`, `scikit-learn`, `xgboost`, `sentence-transformers`, and `pytest` in the dev
@@ -39,8 +39,43 @@ dependency group. `anthropic` is now a runtime dependency too, pinned as `anthro
 | 012 | `eval.py` — `load_eval_set(path)`; `data/triage_eval_set.jsonl` (16 hand-labeled cases) | Complete |
 | 013 | `eval.py` — `deterministic_score(case, result)` | Complete |
 | 014 | `eval.py` — `JUDGE_TOOL_SCHEMA`, `_judge_prompt(result)`, `llm_judge_score(result, *, client=None)` | Complete |
+| 015 | `eval.py` — `report(cases, results, deterministic_scores, judge_scores)` | Complete |
 
-Next action: lesson 015 — the agreement-rate report.
+Next action: run the Phase 3 pipeline live (needs `ANTHROPIC_API_KEY`) to populate
+`reports/phase3_triage_eval.json`, then read the disagreements case by case.
+
+## System diagram
+
+This is the whole pipeline as it now stands, Phase 1 feeding Phase 2 feeding Phase 3.
+
+```mermaid
+flowchart TD
+  A["PaySim CSV<br/>data.load_transactions"] --> B["split.temporal_split<br/>train = early steps, test = later steps"]
+  B --> C["features.add_features<br/>balance-error and ratio columns"]
+  C --> D["imbalance.compute_scale_pos_weight"]
+  D --> E["model.train_baseline<br/>XGBoost"]
+  E --> F["evaluate.report<br/>reports/phase1_report.json"]
+  F -->|"score per transaction"| G["triage.triage"]
+  H["typology corpus"] --> I["retrieval.top_k_typologies_hybrid<br/>TF-IDF + embeddings, blended by alpha"]
+  I --> G
+  G --> J["triage_schema.parse_triage_decision<br/>decision + rationale + cited ids"]
+  J --> K["eval.deterministic_score<br/>decision_match, citation_present"]
+  J --> L["eval.llm_judge_score<br/>agrees, comment"]
+  M["hand-labeled cases<br/>eval.load_eval_set"] --> K
+  K --> N["eval.report<br/>reports/phase3_triage_eval.json"]
+  L --> N
+```
+
+In plain text, for readers without a Mermaid renderer: PaySim CSV is loaded by
+`data.load_transactions`, split by time in `split.temporal_split`, enriched by
+`features.add_features`, weighted by `imbalance.compute_scale_pos_weight`, and used to train an
+XGBoost model in `model.train_baseline`. `evaluate.report` writes `phase1_report.json` and supplies
+a per-transaction score. That score plus typologies retrieved by
+`retrieval.top_k_typologies_hybrid` feed `triage.triage`, whose output is parsed by
+`triage_schema.parse_triage_decision` into a decision, rationale, and cited typology ids.
+Hand-labeled cases from `eval.load_eval_set` plus that output feed `eval.deterministic_score`, while
+the output alone feeds `eval.llm_judge_score`. Both score streams feed `eval.report`, which writes
+`phase3_triage_eval.json`.
 
 ## Per-lesson log
 
@@ -599,8 +634,63 @@ Three additions to `src/aml_triage/eval.py`, plus `import os` at the top:
 `test_judge_prompt_includes_the_rationale_and_cited_typology_text`. The tests prove wiring and
 parsing, not judge accuracy.
 
+## 015 — The agreement-rate report
+
+### What I built
+
+`report(cases, results, deterministic_scores, judge_scores)` added to `src/aml_triage/eval.py`. It
+takes four parallel lists — index `i` is the same case in each — builds
+`lengths = {len(cases), len(results), len(deterministic_scores), len(judge_scores)}` and raises
+`ValueError` showing that set if it does not have exactly one element, raises `ValueError` when
+`n == 0`, and otherwise returns a dict with `n_cases`, `decision_agreement_rate` (the fraction of
+cases where `deterministic_scores[i]["decision_match"]` is True), `citation_present_rate` (the
+fraction where `citation_present` is True), and `judge_agreement_rate` (the fraction where
+`judge_scores[i]["agrees"]` is True). Pure aggregation: no I/O, no model calls. The live pipeline
+run that writes `reports/phase3_triage_eval.json` is not part of the test suite and has not been run
+yet — it needs a real `ANTHROPIC_API_KEY`.
+
+### Knowledge nuggets
+
+- Three separate rates rather than one blended score, because each points at a different upstream
+  owner: a low `decision_agreement_rate` is a classifier or decision-prompt problem, a low
+  `citation_present_rate` is a tool-use problem, a low `judge_agreement_rate` is a grounding problem.
+  Averaging them lets a good rate hide a bad one — 14/16 decisions right alongside 5/16 with no
+  citation blends to roughly 0.78, a number describing neither fact.
+- A missing citation is not just a metric dip: it is a case the human reviewer cannot check the
+  recommendation against, so a right decision with no cited typology is still not an approvable
+  draft.
+- The diagnostic pattern worth naming: `judge_agreement_rate` low (0.3) with
+  `decision_agreement_rate` high (0.9) means the citations and the prose are not connected — the
+  model retrieves typologies, writes a rationale that would read the same with any typologies
+  attached, and reaches the right answer anyway because a lot of PaySim rows are legible from the
+  amount alone. Judgment fine, explanation fluent, link decorative. Invisible in the headline number
+  a stakeholder would quote.
+- Putting the four lengths in a set is the length check: agreement means exactly one element, and the
+  error message shows every length seen, which is what I want when an upstream `zip()` silently
+  truncated a list.
+- `sum()` over booleans works because `True` is `1`, so each `sum(...) / n` is a fraction directly.
+- The `n == 0` guard is not only about `ZeroDivisionError`. A report over zero cases is a number with
+  nothing behind it, and raising is the same instinct as 005's zero-positives guard and 007's
+  no-qualifying-threshold guard.
+- The rate is only defensible because the labels are mine (012). An agreement rate against generated
+  labels measures agreement with a generator.
+- The aggregate is the start of the validation conversation, not the end. 0.7 could be uniform, or
+  near-perfect on obvious cases and near-random on the hard ones; only reading the individual
+  disagreements distinguishes those. At n=16 a single flipped case moves the rate 6 points.
+- What a regulated shop would add: version the report against a specific model and prompt version,
+  re-run it on a refreshed golden set on a schedule, and stratify the set by decision type and
+  transaction family with SME review — rather than generating it once.
+
+### Checks
+
+`uv run pytest ../aml-tutor/tests/015_test_agreement_report.py -v` — Passed, both
+`test_report_computes_the_three_rates` and `test_report_raises_on_mismatched_list_lengths`.
+
 ## Open threads
 
+- The live Phase 3 run that populates `reports/phase3_triage_eval.json` has not happened yet: it
+  needs `ANTHROPIC_API_KEY` and makes two model calls per case (one `triage`, one judge), and until
+  it runs there is no measured agreement number to cite.
 - Optional and non-graded: the manual pressure test from spec 011 — export `ANTHROPIC_API_KEY`, pick
   a transaction the Phase 1 classifier actually flagged, call `triage(...)` without `client=` against
   the live API, and read the decision, rationale, and citations to calibrate whether the model is

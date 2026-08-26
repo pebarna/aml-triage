@@ -53,3 +53,20 @@ def llm_judge_score(result, *, client=None):
   return {"agrees": tool_use.input["agrees"], "comment": tool_use.input["comment"]}
 
 
+def report(cases, results, deterministic_scores, judge_scores):
+  lengths = {len(cases), len(results), len(deterministic_scores), len(judge_scores)}
+  if len(lengths) != 1:
+    raise ValueError(f"mismatched list lengths: {lengths}")
+  
+  n = len(cases)
+  
+  if n == 0:
+    raise ValueError("no cases to report on")
+
+  return {
+    "n_cases": n,
+    "decision_agreement_rate": sum(d["decision_match"] for d in deterministic_scores) / n,
+    "citation_present_rate": sum(d["citation_present"] for d in deterministic_scores) / n,
+    "judge_agreement_rate": sum(j["agrees"] for j in judge_scores) / n,
+  }
+
